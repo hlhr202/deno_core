@@ -306,10 +306,9 @@ pub(crate) fn get_fast_signature(
 fn create_scope(generator_state: &mut GeneratorState) -> TokenStream {
   generator_state.needs_fast_api_callback_options = true;
   gs_quote!(generator_state(fast_api_callback_options) => {
-    // SAFETY: Isolate is valid if this function is being called.
+    // SAFETY: This is using an &FastApiCallbackOptions inside a fast call.
     unsafe {
-      let isolate = &mut *#fast_api_callback_options.isolate;
-      deno_core::v8::HandleScope::for_fast_call(isolate)
+      deno_core::v8::CallbackScope::new(&*#fast_api_callback_options)
     }
   })
 }
@@ -335,8 +334,7 @@ fn throw_type_error(
 pub(crate) fn generate_fast_result_early_exit(
   generator_state: &mut GeneratorState,
 ) -> TokenStream {
-  generator_state.needs_fast_api_callback_options = true;
-  generator_state.needs_fast_opctx = true;
+  generator_state.needs_opctx = true;
   let create_scope = create_scope(generator_state);
   gs_quote!(generator_state(opctx, result) => {
     let #result = match #result {
@@ -403,7 +401,7 @@ pub(crate) fn generate_dispatch_fast(
   let call_args = fastsig.call_args(generator_state)?;
 
   let handle_result = if signature.ret_val.is_async() {
-    generator_state.needs_fast_opctx = true;
+    generator_state.needs_opctx = true;
     let (return_value, mapper, _) =
       map_async_return_type(generator_state, &signature.ret_val).map_err(
         |s| {
@@ -426,8 +424,8 @@ pub(crate) fn generate_dispatch_fast(
     })
   };
 
-  let with_js_runtime_state = if generator_state.needs_fast_js_runtime_state {
-    generator_state.needs_fast_opctx = true;
+  let with_js_runtime_state = if generator_state.needs_js_runtime_state {
+    generator_state.needs_opctx = true;
     gs_quote!(generator_state(js_runtime_state, opctx) => {
       let #js_runtime_state = #opctx.runtime_state();
     })
@@ -435,7 +433,7 @@ pub(crate) fn generate_dispatch_fast(
     quote!()
   };
 
-  let with_opctx = if generator_state.needs_fast_opctx {
+  let with_opctx = if generator_state.needs_opctx {
     generator_state.needs_fast_api_callback_options = true;
     gs_quote!(generator_state(opctx, fast_api_callback_options) => {
       let #opctx: &'s _ = unsafe {
@@ -457,6 +455,15 @@ pub(crate) fn generate_dispatch_fast(
         #throw_exception
       };
       let self_ = &*self_;
+    })
+  } else {
+    quote!()
+  };
+
+  let with_scope = if generator_state.needs_scope {
+    let create_scope = create_scope(generator_state);
+    gs_quote!(generator_state(scope) => {
+      let mut #scope = #create_scope;
     })
   } else {
     quote!()
@@ -530,6 +537,7 @@ pub(crate) fn generate_dispatch_fast(
       let _reentrancy_check_guard = deno_core::_ops::reentrancy_check(&<Self as deno_core::_ops::Op>::DECL);
 
       #with_fast_api_callback_options
+      #with_scope
       #with_opctx
       #with_js_runtime_state
       #with_self
@@ -568,9 +576,11 @@ fn map_v8_fastcall_arg_to_arg(
   let GeneratorState {
     opctx,
     js_runtime_state,
-    needs_fast_opctx: needs_opctx,
+    scope,
+    needs_scope,
+    needs_opctx,
     needs_fast_api_callback_options,
-    needs_fast_js_runtime_state: needs_js_runtime_state,
+    needs_js_runtime_state,
     ..
   } = generator_state;
 
@@ -643,6 +653,10 @@ fn map_v8_fastcall_arg_to_arg(
     Arg::Ref(RefType::Mut, Special::OpState) => {
       *needs_opctx = true;
       quote!(let #arg_ident = &mut ::std::cell::RefCell::borrow_mut(&#opctx.state);)
+    }
+    Arg::Ref(_, Special::HandleScope) => {
+      *needs_scope = true;
+      quote!(let #arg_ident = &mut #scope;)
     }
     Arg::RcRefCell(Special::OpState) => {
       *needs_opctx = true;
@@ -811,6 +825,7 @@ fn map_arg_to_v8_fastcall_type(
     // Virtual OpState arguments
     Arg::RcRefCell(Special::OpState)
     | Arg::Ref(_, Special::OpState)
+    | Arg::Ref(RefType::Mut, Special::HandleScope)
     | Arg::Rc(Special::JsRuntimeState)
     | Arg::Ref(RefType::Ref, Special::JsRuntimeState)
     | Arg::State(..)
