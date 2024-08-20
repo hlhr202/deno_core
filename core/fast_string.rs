@@ -247,7 +247,10 @@ impl FastString {
         v8::String::new_external_onebyte_static(scope, s.as_bytes()).unwrap()
       }
       FastStringInner::StaticConst(s) => {
-        v8::String::new_from_onebyte_const(scope, s.s).unwrap()
+        // TODO: keep track of github issue
+        // https://github.com/denoland/deno_core/issues/738
+        let s_str = s.s.as_str();
+        v8::String::new_external_onebyte_static(scope, s_str.as_bytes()).unwrap()
       }
       _ => {
         v8::String::new_from_utf8(scope, self.as_bytes(), NewStringType::Normal)
